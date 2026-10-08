@@ -122,6 +122,7 @@
   "limits.panel.title": "使用制限",
   "limits.panel.mode_separator": " · ",
   "limits.page.refresh": "制限を更新",
+  "limits.page.refresh_loading": "制限を更新中…",
   "limits.page.refreshed_at": "制限を更新しました：{{time}}",
   "limits.page.refresh_failed": "制限を更新できませんでした。",
   "limits.page.refresh_partial": "{{time}} に限度を更新しましたが、一部のデータはキャッシュ由来または更新に失敗しています。",

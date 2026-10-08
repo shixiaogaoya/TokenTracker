@@ -1623,6 +1623,7 @@ subscriptions.form.provider_taken,ui,LimitsPage,SubscriptionSettingsCard,form_pr
 subscriptions.form.provider_taken_suffix,ui,LimitsPage,SubscriptionSettingsCard,form_provider_taken_suffix,"(already subscribed)",,active
 limits.page.openSubscriptions,ui,LimitsPage,LimitsPage,open_subscriptions,"Subscriptions",,active
 limits.page.refresh,ui,LimitsPage,LimitsPage,refresh,"Refresh limits",,active
+limits.page.refresh_loading,ui,LimitsPage,LimitsPage,refresh_loading,"Refreshing limits…",,active
 limits.page.refreshed_at,ui,LimitsPage,LimitsPage,refreshed_at,"Limits updated {{time}}",,active
 limits.page.refresh_failed,ui,LimitsPage,LimitsPage,refresh_failed,"Couldn't refresh limits.",,active
 limits.page.refresh_partial,ui,LimitsPage,LimitsPage,refresh_partial,"Limits refreshed {{time}}, but some data still comes from cache or failed to update.",,active

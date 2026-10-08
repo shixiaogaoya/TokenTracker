@@ -292,6 +292,8 @@ describe("LimitsPage", () => {
     refreshLimitsMock.mockResolvedValueOnce({
       ...apiLimits,
       kimi: { ...apiLimits.kimi, provenance: { source: "disk-cache", stale: true } },
+      codex: { configured: false },
+      claude: { configured: false, error: "No credentials", provenance: { stale: true } },
       fetched_at: "2026-10-07T02:30:00.000Z",
     });
 
@@ -387,6 +389,7 @@ describe("LimitsPage", () => {
 
     expect(refreshLimitsMock).toHaveBeenCalledTimes(1);
     expect(refreshButton).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Refreshing limits…");
 
     await act(async () => {
       resolveRefresh({ ...apiLimits, fetched_at: "2026-10-07T03:00:00.000Z" });
@@ -394,5 +397,6 @@ describe("LimitsPage", () => {
     await waitFor(() => expect(refreshButton).toBeEnabled());
     expect(refreshLimitsMock).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/Limits updated/)).toBeInTheDocument();
+    expect(screen.queryByText("Refreshing limits…")).not.toBeInTheDocument();
   });
 });

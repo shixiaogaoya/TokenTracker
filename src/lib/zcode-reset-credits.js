@@ -25,7 +25,7 @@ function normalizeZcodeResetCredits(body, { nowMs = Date.now() } = {}) {
   return result;
 }
 
-/** Read inventory only; the ZCode and regional login tokens serve different headers. */
+/** Read inventory only; send the two login tokens exclusively to ZCode's fixed status endpoint. */
 async function fetchZcodeResetCredits({
   zcodeToken, codingPlanToken, teamContext, fetchImpl = fetch, nowMs = Date.now(), timeoutMs = 2000,
 }) {
@@ -44,7 +44,8 @@ async function fetchZcodeResetCredits({
   try {
     const request = Promise.resolve().then(async () => {
       const response = await fetchImpl(ZCODE_RESET_STATUS_URL, {
-        method: "GET", headers, signal: controller.signal,
+        // Custom auth headers survive cross-origin redirects; never forward them.
+        method: "GET", headers, signal: controller.signal, redirect: "error",
       });
       if (!response.ok) throw new Error(`ZCode reset credits API returned HTTP ${response.status}`);
       const body = await response.json();

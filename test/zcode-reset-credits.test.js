@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const http = require("node:http");
 const { it } = require("node:test");
 const { fetchZcodeResetCredits, normalizeZcodeResetCredits } = require("../src/lib/zcode-reset-credits");
 
@@ -45,6 +46,7 @@ it("uses only the read-only status endpoint and scopes team inventory", async ()
     fetchImpl: async (url, options) => {
       assert.equal(url, "https://zcode.z.ai/api/v1/coding-plan/reset/status");
       assert.equal(options.method, "GET");
+      assert.equal(options.redirect, "error");
       assert.ok(options.signal instanceof AbortSignal);
       assert.deepEqual(options.headers, {
         Authorization: "Bearer zcode-jwt", "X-Bigmodel-Authorization": "regional-jwt",
@@ -56,6 +58,34 @@ it("uses only the read-only status endpoint and scopes team inventory", async ()
   });
   assert.equal(out.five_hour.length, 3);
   assert.equal(out.weekly.length, 1);
+});
+
+it("rejects redirects without sending credentials to their destination", async () => {
+  let destinationRequests = 0;
+  const destination = http.createServer((_req, res) => {
+    destinationRequests += 1;
+    res.end("{}");
+  });
+  await new Promise((resolve) => destination.listen(0, "127.0.0.1", resolve));
+  const origin = http.createServer((_req, res) => {
+    res.writeHead(302, { Location: `http://127.0.0.1:${destination.address().port}/status` });
+    res.end();
+  });
+  try {
+    await new Promise((resolve) => origin.listen(0, "127.0.0.1", resolve));
+    await assert.rejects(fetchZcodeResetCredits({
+      zcodeToken: "fixture-zcode-token", codingPlanToken: "fixture-regional-token",
+      fetchImpl: (_url, options) => fetch(`http://127.0.0.1:${origin.address().port}/status`, options),
+    }));
+    assert.equal(destinationRequests, 0);
+  } finally {
+    origin.closeAllConnections();
+    destination.closeAllConnections();
+    await Promise.all([
+      new Promise((resolve) => origin.close(resolve)),
+      new Promise((resolve) => destination.close(resolve)),
+    ]);
+  }
 });
 
 it("surfaces HTTP and API errors without exposing the upstream response", async () => {

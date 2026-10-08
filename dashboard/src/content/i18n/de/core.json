@@ -104,6 +104,7 @@
   "limits.panel.title": "Nutzungslimits",
   "limits.panel.mode_separator": " · ",
   "limits.page.refresh": "Limits aktualisieren",
+  "limits.page.refresh_loading": "Limits werden aktualisiert…",
   "limits.page.refreshed_at": "Limits aktualisiert: {{time}}",
   "limits.page.refresh_failed": "Limits konnten nicht aktualisiert werden.",
   "limits.page.refresh_partial": "Limits um {{time}} aktualisiert, aber einige Daten stammen noch aus dem Cache oder konnten nicht aktualisiert werden.",

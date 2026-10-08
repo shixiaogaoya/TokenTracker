@@ -47,7 +47,8 @@ function formatRefreshedAt(iso) {
  */
 function describeRefreshOutcome(data) {
   const providers = Object.entries(data || {}).filter(
-    ([key, value]) => key !== "fetched_at" && value && typeof value === "object",
+    ([key, value]) => key !== "fetched_at" && value && typeof value === "object"
+      && value.configured !== false,
   );
   const errored = providers.filter(([, provider]) => Boolean(provider.error));
   // ZCode folds reset cards and Start Plan grants into its row from separate
@@ -261,6 +262,9 @@ export function LimitsPage() {
             </div>
           </div>
 
+          <span role="status" className="sr-only">
+            {isRefreshing ? copy("limits.page.refresh_loading") : ""}
+          </span>
           {refreshNotice?.kind === "updated" ? (
             <p role="status" className="mb-4 text-sm text-emerald-700 dark:text-emerald-300">
               {copy("limits.page.refreshed_at", { time: formatRefreshedAt(refreshNotice.at) })}
