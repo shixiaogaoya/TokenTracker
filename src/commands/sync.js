@@ -145,6 +145,7 @@ const {
   toUtcHalfHourStart,
   totalsKey,
   claudeMessageDedupKey,
+  hasZcodeCursorState,
   resolveZcodeInstallPaths,
 } = require("../lib/rollout");
 const { computeClaudeGroundTruthBuckets } = require("../lib/claude-categorizer");
@@ -1737,9 +1738,20 @@ async function cmdSync(argv, context = {}) {
       const zcodeWslValue = wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null;
       const zcodePaths = resolveZcodeInstallPaths(
         { nativeValue: zcodeNativeValue, wslValue: zcodeWslValue }, process.env,
-        { selection: cursors.zcodeInstallSelection },
+        { cursors },
       );
       if (zcodePaths.native || zcodePaths.wsl) {
+        const mode = wsl.getWslMode(process.env);
+        if (process.platform === "win32" && ["native-first", "wsl-first"].includes(mode) &&
+            !cursors.zcodeInstallSelection && hasZcodeCursorState(cursors)) {
+          // Preserve legacy ownership before a repair can clear old buckets,
+          // even when the selected database currently has no rows to parse.
+          cursors.zcodeInstallSelection = {
+            mode, zcodeHome: process.env.ZCODE_HOME?.trim() || null,
+            dbPath: zcodePaths.native || zcodePaths.wsl,
+          };
+          cursorStore.requiresCommit = true;
+        }
         if (progress?.enabled) progress.start(`Parsing ZCode ${renderBar(0)} | buckets 0`);
         try {
           const nativeUsageAvailable = [zcodePaths.native, zcodePaths.wsl]
@@ -1767,7 +1779,6 @@ async function cmdSync(argv, context = {}) {
             queuePath, projectQueuePath, onProgress: makeProviderProgress("ZCode"),
           });
           if (zcodeResult.recordsProcessed > 0) {
-            const mode = wsl.getWslMode(process.env);
             if (process.platform === "win32" && ["native-first", "wsl-first"].includes(mode)) {
               cursors.zcodeInstallSelection = {
                 mode, zcodeHome: process.env.ZCODE_HOME?.trim() || null,

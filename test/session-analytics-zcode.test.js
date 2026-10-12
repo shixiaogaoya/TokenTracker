@@ -19,11 +19,11 @@ const {
   summarizeSessions,
   resolveSessionSidecarPath,
 } = require("../src/lib/session-analytics");
-const { readZcodeDbMessages, parseOpencodeDbIncremental, zcodeDbHasContent, resolveZcodeInstallPaths } = require("../src/lib/rollout");
+const { readZcodeDbMessages, parseOpencodeDbIncremental, zcodeDbHasContent, hasZcodeCursorState, resolveZcodeInstallPaths } = require("../src/lib/rollout");
 const { multiInstallParse } = require("../src/lib/multi-install-parser");
 const { cmdSync } = require("../src/commands/sync");
 const { cmdStatus } = require("../src/commands/status");
-const { readCursorStateSummary } = require("../src/lib/cursor-store");
+const { openCursorStore, readCursorStateSummary } = require("../src/lib/cursor-store");
 const { withHome } = require("./helpers/with-home");
 const { mockPlatform, mockMethod } = require("./helpers/mock");
 const wsl = require("../src/lib/wsl-probe");
@@ -855,6 +855,144 @@ for (const mode of ["wsl-first", "native-first"]) {
             { TOKENTRACKER_WSL_MODE: explicitMode }, { platform: "win32", selection });
           assert.deepEqual(Object.values(paths).filter(Boolean), expected, "explicit modes override the saved priority selection");
         }
+      } finally {
+        restoreHome();
+        for (const [key, value] of Object.entries(previousEnv)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
+  }
+}
+
+sqliteTest("pre-marker ZCode history retains priority ownership while fresh metadata permits empty-shell fallback", (t) => {
+  const preferred = buildDb(t, () => {});
+  const alternate = buildDb(t, (db) => insertSession(db, { id: "alternate" }));
+  for (const [name, cursors, hasHistory] of [
+    ["messages", { zcode: { messages: { "old-request": { total_tokens: 900 } } } }, true],
+    ["hourly buckets", { hourly: { buckets: { "zcode|GLM-5.3|2026-10-08T10:00:00.000Z": {} } } }, true],
+    ["project buckets", { projectHourly: { buckets: { "project|zcode|2026-10-08T10:00:00.000Z": {} } } }, true],
+    ["empty messages", { zcode: { messages: {} } }, false],
+    ["updatedAt only", { zcode: { updatedAt: iso(T0) } }, false],
+    ["migrations only", { migrations: { zcodeNativeUsageRepair_2026_08: { appliedAt: iso(T0) }, zcodeInclusiveTokenRepair_2026_09: { appliedAt: iso(T0) } } }, false],
+  ]) {
+    assert.equal(hasZcodeCursorState(cursors), hasHistory, name);
+    for (const mode of ["native-first", "wsl-first"]) {
+      const paths = mode === "native-first"
+        ? { nativeValue: preferred.dbPath, wslValue: alternate.dbPath }
+        : { nativeValue: alternate.dbPath, wslValue: preferred.dbPath };
+      const env = { TOKENTRACKER_WSL_MODE: mode };
+      assert.deepEqual(resolveZcodeInstallPaths(paths, env, { platform: "win32", cursors }),
+        { native: hasHistory ? preferred.dbPath : alternate.dbPath, wsl: null }, `${mode}: ${name}`);
+      if (hasHistory) {
+        const missing = { ...paths, [mode === "native-first" ? "nativeValue" : "wslValue"]: null };
+        assert.deepEqual(resolveZcodeInstallPaths(missing, env, { platform: "win32", cursors }),
+          { native: alternate.dbPath, wsl: null }, `${mode}: retain the existing fallback when the preferred install is unavailable`);
+      }
+    }
+  }
+});
+
+for (const mode of ["wsl-first", "native-first"]) {
+  for (const forceV2 of [false, true]) {
+    sqliteTest(`${mode} upgrades pre-marker history without importing the alternate database (${forceV2 ? "v2" : "legacy"} cursor store)`, async (t) => {
+      const preferred = buildDb(t, (db) => {
+        insertSession(db, { id: "old-preferred", directory: "/repo/preferred" });
+        insertModelUsage(db, { id: "old-request", sessionId: "old-preferred", input: 500, output: 400 });
+      });
+      const alternate = buildDb(t, (db) => {
+        insertSession(db, { id: "alternate", directory: "/repo/alternate" });
+        insertModelUsage(db, { id: "alternate-request", sessionId: "alternate", input: 2000, output: 1000 });
+      });
+      const native = mode === "native-first" ? preferred : alternate;
+      const other = mode === "native-first" ? alternate : preferred;
+      const restoreHome = withHome(native.home);
+      const previousEnv = { ZCODE_HOME: process.env.ZCODE_HOME, TOKENTRACKER_WSL_MODE: process.env.TOKENTRACKER_WSL_MODE };
+      mockPlatform(t, "win32");
+      mockMethod(t, wsl, "discoverWslHome", (provider) => provider === ".zcode" ? path.join(other.home, ".zcode") : null);
+      mockMethod(t, global, "fetch", async () => { throw new Error("unexpected network access"); });
+      process.env.ZCODE_HOME = path.join(native.home, ".zcode");
+      process.env.TOKENTRACKER_WSL_MODE = mode;
+      const trackerDir = path.join(native.home, ".tokentracker", "tracker");
+      const cursorsPath = path.join(trackerDir, "cursors.json");
+      const queuePath = path.join(trackerDir, "queue.jsonl");
+      const projectQueuePath = path.join(trackerDir, "project.queue.jsonl");
+      const statusZcode = async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        let output = "";
+        const write = process.stdout.write;
+        process.stdout.write = (chunk) => { output += chunk; return true; };
+        try { await cmdStatus(); } finally { process.stdout.write = write; }
+        return output.split("\n").find((line) => line.startsWith("- ZCode:"));
+      };
+      const queuedTotal = (content) => {
+        const latest = new Map(content.trim().split("\n").filter(Boolean).map((line) => {
+          const row = JSON.parse(line);
+          return [`${row.source}:${row.model}:${row.hour_start}`, row];
+        }));
+        return [...latest.values()].reduce((sum, row) => sum + row.total_tokens, 0);
+      };
+      try {
+        // Generate the older ledger through the real command, then remove only
+        // the new ownership marker. Completed repairs must not hide a switch
+        // by rebuilding the ledger from the alternate database.
+        await cmdSync(["--auto", "--source=zcode"], { cursorStoreOptions: { forceV2: false }, scanSources: ["zcode"] });
+        const first = fs.readFileSync(queuePath, "utf8");
+        const firstProject = fs.readFileSync(projectQueuePath, "utf8");
+        assert.equal(queuedTotal(first), 900);
+        const legacy = JSON.parse(fs.readFileSync(cursorsPath, "utf8"));
+        assert.equal(legacy.zcodeInstallSelection.dbPath, preferred.dbPath);
+        assert.ok(legacy.migrations.zcodeNativeUsageRepair_2026_08);
+        assert.ok(legacy.migrations.zcodeInclusiveTokenRepair_2026_09);
+        delete legacy.zcodeInstallSelection;
+        fs.writeFileSync(cursorsPath, JSON.stringify(legacy));
+        if (forceV2) {
+          const store = await openCursorStore({ trackerDir, forceV2: true });
+          assert.equal(store.mode, "v2");
+          await store.commit();
+        }
+        const before = await readCursorStateSummary({ trackerDir });
+        assert.equal(before.mode, forceV2 ? "v2" : "legacy");
+        assert.equal(before.cursors.zcodeInstallSelection, undefined);
+        const emptied = new DatabaseSync(preferred.dbPath);
+        emptied.exec("DELETE FROM model_usage; DELETE FROM message; DELETE FROM session;");
+        emptied.close();
+
+        // Read-only commands also need the entire pre-marker cursor history,
+        // before sync has had an opportunity to persist the marker.
+        assert.deepEqual((await discoverSessionFiles(native.home, process.env, { probeWsl: true })).zcode, [preferred.dbPath]);
+        assert.ok((await statusZcode()).includes(preferred.dbPath));
+        const diagnostics = {};
+        await cmdSync(["--auto", "--from-retry", "--source=zcode"], {
+          cursorStoreOptions: { forceV2 }, scanSources: ["zcode"], diagnostics,
+        });
+        assert.equal(diagnostics.cursor_commits, 1, "an empty incremental sync must commit the new ownership marker");
+        assert.equal(fs.readFileSync(queuePath, "utf8"), first, "the alternate 3000 tokens must not join the old 900-token ledger");
+        assert.equal(fs.readFileSync(projectQueuePath, "utf8"), firstProject);
+        const upgraded = await readCursorStateSummary({ trackerDir });
+        assert.equal(upgraded.mode, forceV2 ? "v2" : "legacy");
+        assert.deepEqual(upgraded.cursors.zcodeInstallSelection, {
+          mode, zcodeHome: process.env.ZCODE_HOME, dbPath: preferred.dbPath,
+        }, "ownership is persisted even when the old database has no rows");
+        const discovered = await discoverSessionFiles(native.home, process.env, { probeWsl: true });
+        assert.deepEqual(discovered.zcode, [preferred.dbPath]);
+        assert.deepEqual(await scanZcodeSessions(discovered.zcode), []);
+        const status = await statusZcode();
+        assert.ok(status.includes(preferred.dbPath));
+        assert.ok(!status.includes(alternate.dbPath));
+
+        const restored = new DatabaseSync(preferred.dbPath);
+        insertSession(restored, { id: "old-preferred", directory: "/repo/preferred" });
+        insertModelUsage(restored, { id: "new-request", sessionId: "old-preferred", startedAt: T0 + 60000, input: 100, output: 100 });
+        restored.close();
+        await cmdSync(["--auto", "--source=zcode"], { cursorStoreOptions: { forceV2 }, scanSources: ["zcode"] });
+        const updated = fs.readFileSync(queuePath, "utf8");
+        const updatedProject = fs.readFileSync(projectQueuePath, "utf8");
+        assert.equal(queuedTotal(updated), 1100, "the original owner can still append new requests");
+        await cmdSync(["--auto", "--source=zcode"], { cursorStoreOptions: { forceV2 }, scanSources: ["zcode"] });
+        assert.equal(fs.readFileSync(queuePath, "utf8"), updated, "a repeated sync does not count the new request twice");
+        assert.equal(fs.readFileSync(projectQueuePath, "utf8"), updatedProject);
       } finally {
         restoreHome();
         for (const [key, value] of Object.entries(previousEnv)) {

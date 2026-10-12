@@ -587,7 +587,7 @@ async function cmdStatus(argv = []) {
     : null;
   const zcodePaths = resolveZcodeInstallPaths(
     { nativeValue: zcodeNativeValue, wslValue: wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null },
-    process.env, { selection: cursors?.zcodeInstallSelection },
+    process.env, { cursors },
   );
   const zcodeActive = formatResolvedPaths(zcodePaths);
   const zcodeInstalled = zcodeActive.length > 0;

@@ -1999,7 +1999,7 @@ async function discoverSessionFiles(home, env = process.env, deps = {}) {
   const zcodePaths = resolveZcodeInstallPaths({
     nativeValue: zcodePlatform === "win32" ? zcodeNativeDbPath : zcodeNativeExisting,
     wslValue: zcodeWslDbPath,
-  }, env, { platform: zcodePlatform, selection: cursors?.zcodeInstallSelection });
+  }, env, { platform: zcodePlatform, cursors });
   const zcode = [...new Set(Object.values(zcodePaths).filter(Boolean))];
   const opencodeNativeDir = env.OPENCODE_HOME || path.join(env.XDG_DATA_HOME || path.join(home, ".local", "share"), "opencode");
   const opencodeWslDir = zcodePlatform === "win32" && zcodeProbeWsl && wsl.shouldProbeWsl(env)

@@ -5579,13 +5579,21 @@ function zcodeDbHasContent(dbPath, sqliteOptions = {}) {
   }
 }
 
+function hasZcodeCursorState(cursors) {
+  return [cursors?.zcode, cursors?.zcode?.native, cursors?.zcode?.wsl]
+    .some((state) => Object.keys(state?.messages || {}).length > 0) ||
+    Object.keys(cursors?.hourly?.buckets || {}).some((key) => key.startsWith("zcode|")) ||
+    Object.keys(cursors?.hourly?.groupQueued || {}).some((key) => key.startsWith("zcode|")) ||
+    Object.keys(cursors?.projectHourly?.buckets || {}).some((key) => key.includes("|zcode|"));
+}
+
 // Sync, session discovery and status must select the same installs. Once sync
 // records a priority-mode choice, retain it: switching databases underneath a
 // flat cursor would accumulate both installs in the same usage ledger.
 function resolveZcodeInstallPaths({ nativeValue, wslValue } = {}, env = process.env, deps = {}) {
   const mode = wsl.getWslMode(env);
   const priorityMode = (deps.platform || process.platform) === "win32" && ["native-first", "wsl-first"].includes(mode);
-  const selection = deps.selection;
+  const selection = deps.selection || deps.cursors?.zcodeInstallSelection;
   if (priorityMode && selection?.mode === mode &&
       selection.zcodeHome === (env.ZCODE_HOME?.trim() || null) &&
       typeof selection.dbPath === "string" && selection.dbPath) {
@@ -5594,7 +5602,9 @@ function resolveZcodeInstallPaths({ nativeValue, wslValue } = {}, env = process.
     return { native: selection.dbPath, wsl: null };
   }
   const paths = resolveInstallPaths({ nativeValue, wslValue }, env, deps);
-  if (!priorityMode) {
+  if (!priorityMode || (!selection && hasZcodeCursorState(deps.cursors))) {
+    // Legacy cursors followed the original install resolver. Keep that choice
+    // rather than feeding another database into an already-owned flat ledger.
     return paths;
   }
   const picked = paths.native || paths.wsl;
@@ -24659,6 +24669,7 @@ module.exports = {
   normalizeOpencodeModelFields,
   hasZcodeNativeUsageSchema,
   zcodeDbHasContent,
+  hasZcodeCursorState,
   resolveZcodeInstallPaths,
   resolveQoderDbPath,
   resolveQoderDbPaths,
