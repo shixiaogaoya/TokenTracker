@@ -3,6 +3,7 @@ const path = require("node:path");
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
 const pkg = require("../../package.json");
+const { resolveDumateDbPaths } = require("../lib/dumate");
 
 const { readJson } = require("../lib/fs");
 const { readCursorStateSummary } = require("../lib/cursor-store");
@@ -564,6 +565,10 @@ async function cmdStatus(argv = []) {
   const kiloActive = formatResolvedPaths(kiloPaths);
   const kiloInstalled = kiloActive.length > 0;
   const kiloDbPath = kiloActive.join(" | ");
+
+  const dumateDbPaths = resolveDumateDbPaths({ home });
+  const dumateInstalled = dumateDbPaths.length > 0;
+  const dumateDbPath = dumateDbPaths.join(" | ");
 
   // Mimo (mimocode — OpenCode-fork SQLite) — passive scan of mimocode.db.
   const mimoNativeValue = resolveMimoNativeDbPath({ home });
@@ -1137,6 +1142,9 @@ async function cmdStatus(argv = []) {
         kilo_cli: kiloInstalled
           ? { installed: true, detail: kiloDbPath }
           : { installed: false },
+        dumate: dumateInstalled
+          ? { installed: true, detail: dumateDbPath }
+          : { installed: false },
         mimo: mimoInstalled
           ? { installed: true, detail: mimoDbPath }
           : { installed: false },
@@ -1332,6 +1340,9 @@ async function cmdStatus(argv = []) {
         : null,
       kiloInstalled
         ? `- Kilo CLI: passive reader (${kiloDbPath})`
+        : null,
+      dumateInstalled
+        ? `- DuMate: passive reader (${dumateDbPath})`
         : null,
       mimoInstalled
         ? `- Mimo: passive reader (${mimoDbPath})`
