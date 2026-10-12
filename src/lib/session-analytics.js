@@ -28,7 +28,7 @@ const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
-const { listClaudeProjectFiles, listRolloutFilesDeep, claudeMessageDedupKey, normalizeClaudeUsage, readZcodeDbMessages, coerceEpochMs, normalizeOpencodeModelFields, deriveOpencodeMessageFingerprint } = require("./rollout");
+const { listClaudeProjectFiles, listRolloutFilesDeep, claudeMessageDedupKey, normalizeClaudeUsage, readZcodeDbMessages, coerceEpochMs, resolveZcodeInstallPaths, normalizeOpencodeModelFields, deriveOpencodeMessageFingerprint } = require("./rollout");
 const { parseCodexRolloutFile } = require("./codex-rollout-parser");
 const { computeRowCost, getModelPricingInfo } = require("./pricing");
 const { normalizePerformance, mergePerformance, createClaudePerformanceCollector, createCodexPerformanceCollector, createZcodePerformanceCollector } = require("./session-performance");
@@ -1804,7 +1804,7 @@ async function discoverSessionFiles(home, env = process.env, deps = {}) {
   // it like the usage sync does (src/commands/sync.js): native candidate first
   // (ZCODE_HOME, home, win32 APPDATA fallback), then the WSL install when the
   // WSL mode probes it, picked with the same mode priority (default wsl-first)
-  // so the browser reads the same installs the usage card counts. "both"
+  // so the browser reads the same install the usage card counts. "both"
   // preserves both paths; the scanner merges shared session/event identities.
   const zcodePlatform = deps.platform || process.platform;
   const zcodeNativeDbPath = (deps.resolveZcodeNativeDbPath || resolveZcodeNativeDbPath)({ home, env, platform: zcodePlatform });
@@ -1820,14 +1820,12 @@ async function discoverSessionFiles(home, env = process.env, deps = {}) {
     : null;
   const zcodeExisting = (dbPath) => (dbPath && fs.existsSync(dbPath) ? dbPath : null);
   const zcodeWslDbPath = zcodeWslHome ? path.join(zcodeWslHome, "cli", "db", "db.sqlite") : null;
-  const zcodePaths = zcodePlatform === "win32"
-    ? wsl.resolveAllWin32Paths({
-      nativeValue: zcodeExisting(zcodeNativeDbPath),
-      wslValue: zcodeExisting(zcodeWslDbPath),
-      env,
-      platform: zcodePlatform,
-    })
-    : { native: zcodeExisting(zcodeNativeDbPath), wsl: null };
+  const zcodeNativeExisting = zcodeExisting(zcodeNativeDbPath);
+  const zcodeWslExisting = zcodeExisting(zcodeWslDbPath);
+  const zcodePaths = resolveZcodeInstallPaths({
+    nativeValue: zcodeNativeExisting,
+    wslValue: zcodeWslExisting,
+  }, env, { platform: zcodePlatform });
   const zcode = [...new Set(Object.values(zcodePaths).filter(Boolean))];
   return { claude, codex: groupCodexFiles([...codex, ...archived]), grok, zcode, incomplete };
 }

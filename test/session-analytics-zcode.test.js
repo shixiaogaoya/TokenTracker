@@ -19,7 +19,8 @@ const {
   summarizeSessions,
   resolveSessionSidecarPath,
 } = require("../src/lib/session-analytics");
-const { readZcodeDbMessages, parseOpencodeDbIncremental } = require("../src/lib/rollout");
+const { readZcodeDbMessages, parseOpencodeDbIncremental, zcodeDbHasContent, resolveZcodeInstallPaths } = require("../src/lib/rollout");
+const { multiInstallParse } = require("../src/lib/multi-install-parser");
 const { withHome } = require("./helpers/with-home");
 const wsl = require("../src/lib/wsl-probe");
 
@@ -687,6 +688,91 @@ sqliteTest("ZCode discovery respects every install mode including both on a simu
   }
 });
 
+sqliteTest("ZCode content probes distinguish confirmed empty databases from read failures", (t) => {
+  const empty = buildDb(t, () => {});
+  const populated = buildDb(t, (db) => insertSession(db, { id: "real" }));
+  assert.equal(zcodeDbHasContent(empty.dbPath), false);
+  assert.equal(zcodeDbHasContent(populated.dbPath), true);
+  fs.writeFileSync(empty.dbPath, "unreadable sqlite database");
+  assert.equal(zcodeDbHasContent(empty.dbPath), null);
+  assert.equal(zcodeDbHasContent(path.join(empty.home, "missing.sqlite")), null);
+});
+
+sqliteTest("empty-shell fallback preserves both and exclusive modes in sync and session discovery", async (t) => {
+  const populated = buildDb(t, (db) => {
+    insertSession(db, { id: "real" });
+    insertModelUsage(db, { id: "request", sessionId: "real", input: 500, output: 400 });
+  });
+  const empty = buildDb(t, () => {});
+  for (const [native, other] of [[populated, empty], [empty, populated]]) {
+    for (const [mode, expected] of [
+      ["both", [native.dbPath, other.dbPath]],
+      ["native-only", [native.dbPath]],
+      ["wsl-only", [other.dbPath]],
+      ["native-first", [populated.dbPath]],
+      ["wsl-first", [populated.dbPath]],
+    ]) {
+      const env = { ZCODE_HOME: path.join(native.home, ".zcode"), TOKENTRACKER_WSL_MODE: mode };
+      const paths = resolveZcodeInstallPaths({ nativeValue: native.dbPath, wslValue: other.dbPath }, env, { platform: "win32" });
+      assert.deepEqual(Object.values(paths).filter(Boolean), expected, `sync ${mode}`);
+      const discovered = await discoverSessionFiles(native.home, env, {
+        platform: "win32", probeWsl: true,
+        discoverWslHome: (provider) => provider === ".zcode" ? path.join(other.home, ".zcode") : null,
+      });
+      assert.deepEqual(discovered.zcode, expected, `sessions ${mode}`);
+    }
+  }
+});
+
+sqliteTest("a failed preferred ZCode database remains discoverable instead of being replaced", async (t) => {
+  const healthy = buildDb(t, (db) => insertSession(db, { id: "real" }));
+  const broken = buildDb(t, () => {});
+  fs.writeFileSync(broken.dbPath, "unreadable sqlite database");
+  for (const [mode, native, other] of [
+    ["wsl-first", healthy, broken],
+    ["native-first", broken, healthy],
+  ]) {
+    const env = { ZCODE_HOME: path.join(native.home, ".zcode"), TOKENTRACKER_WSL_MODE: mode };
+    const paths = resolveZcodeInstallPaths({ nativeValue: native.dbPath, wslValue: other.dbPath }, env, { platform: "win32" });
+    assert.deepEqual(Object.values(paths).filter(Boolean), [broken.dbPath]);
+    const discovered = await discoverSessionFiles(native.home, env, {
+      platform: "win32", probeWsl: true,
+      discoverWslHome: (provider) => provider === ".zcode" ? path.join(other.home, ".zcode") : null,
+    });
+    assert.deepEqual(discovered.zcode, [broken.dbPath]);
+    await assert.rejects(scanZcodeSessions(discovered.zcode));
+  }
+});
+
+sqliteTest("both-mode usage sync counts a populated install once beside an empty shell", async (t) => {
+  const empty = buildDb(t, () => {});
+  const populated = buildDb(t, (db) => {
+    insertSession(db, { id: "real" });
+    insertModelUsage(db, { id: "request", sessionId: "real", input: 500, output: 400 });
+  });
+  const paths = resolveZcodeInstallPaths({ nativeValue: empty.dbPath, wslValue: populated.dbPath },
+    { TOKENTRACKER_WSL_MODE: "both" }, { platform: "win32" });
+  const queuePath = path.join(empty.home, "queue.jsonl");
+  const reads = [];
+  const cursors = {};
+  for (let pass = 0; pass < 2; pass += 1) {
+    await multiInstallParse({
+      paths, providerName: "zcode", cursors, queuePath,
+      getParams: (dbPath) => ({ dbPath }),
+      parserFn: async (options) => {
+        reads.push(options.dbPath);
+        return parseOpencodeDbIncremental({ ...options, dbMessages: readZcodeDbMessages(options.dbPath), source: "zcode", cursorKey: "zcode" });
+      },
+    });
+    const latest = new Map(fs.readFileSync(queuePath, "utf8").trim().split("\n").map((line) => {
+      const row = JSON.parse(line);
+      return [`${row.source}:${row.model}:${row.hour_start}`, row];
+    }));
+    assert.equal([...latest.values()].reduce((sum, row) => sum + row.total_tokens, 0), 900);
+  }
+  assert.deepEqual(reads, [empty.dbPath, populated.dbPath, empty.dbPath, populated.dbPath]);
+});
+
 sqliteTest("Codex and ZCode lineage remains independent when their session IDs collide", async (t) => {
   const { dbPath } = buildDb(t, (db) => {
     insertSession(db, { id: "root" });
@@ -803,6 +889,50 @@ wslTest("zcode discovery follows the WSL install when no native db exists", asyn
     TOKENTRACKER_WSL_MODE: "wsl-first",
   }, { discoverWslHome: () => wslHome, probeWsl: true });
   assert.deepEqual(discovered.zcode, [wslDb]);
+});
+
+wslTest("an empty WSL db must not shadow the populated native one", async (t) => {
+  const nativeHome = fs.mkdtempSync(path.join(os.tmpdir(), "tt-zcode-native-full-"));
+  const wslHome = fs.mkdtempSync(path.join(os.tmpdir(), "tt-zcode-wsl-shell-"));
+  t.after(() => {
+    fs.rmSync(nativeHome, { recursive: true, force: true });
+    fs.rmSync(wslHome, { recursive: true, force: true });
+  });
+  // Native install with a real session, WSL install that only ran once and
+  // keeps an empty database (observed on a real machine): under the default
+  // wsl-first single pick the shell db evicted the populated native one and
+  // the browser showed zero ZCode sessions. The mode pick must yield to the
+  // install that actually holds content.
+  const nativeDb = path.join(nativeHome, ".zcode", "cli", "db", "db.sqlite");
+  fs.mkdirSync(path.dirname(nativeDb), { recursive: true });
+  const native = createFixtureDb(nativeDb);
+  insertSession(native, { id: "sess-native-real", directory: "C:\\repo\\native", created: T0 });
+  insertModelUsage(native, { id: "n1", sessionId: "sess-native-real", startedAt: T0, input: 500, output: 400, durationMs: 3000 });
+  native.close();
+  const wslDb = path.join(wslHome, "cli", "db", "db.sqlite");
+  fs.mkdirSync(path.dirname(wslDb), { recursive: true });
+  createFixtureDb(wslDb).close();
+
+  const discovered = await discoverSessionFiles(nativeHome, {
+    ZCODE_HOME: path.join(nativeHome, ".zcode"),
+    TOKENTRACKER_WSL_MODE: "wsl-first",
+  }, { discoverWslHome: () => wslHome, probeWsl: true });
+  assert.deepEqual(discovered.zcode, [nativeDb]);
+
+  // "both" still reads every path; the empty db simply contributes nothing.
+  const both = await discoverSessionFiles(nativeHome, {
+    ZCODE_HOME: path.join(nativeHome, ".zcode"),
+    TOKENTRACKER_WSL_MODE: "both",
+  }, { discoverWslHome: () => wslHome, probeWsl: true });
+  assert.deepEqual([...both.zcode].sort(), [nativeDb, wslDb].sort());
+
+  // End to end: the populated native sessions reach the analytics build even
+  // though the shell WSL db sits beside them.
+  const built = await buildSessionAnalytics({ home: nativeHome, force: true });
+  const zcodeBuilt = built.filter((row) => row.source === "zcode");
+  assert.equal(zcodeBuilt.length, 1);
+  assert.equal(zcodeBuilt[0].session_id, "sess-native-real");
+  assert.equal(zcodeBuilt[0].total_tokens, 500 + 400);
 });
 
 wslTest("zcode discovery skips WSL for an injected home unless probeWsl opts in", async (t) => {
