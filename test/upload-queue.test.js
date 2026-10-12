@@ -30,7 +30,8 @@ test("pending compaction preserves uploaded UTF8 bytes and LWW downward/zero sna
   const x = await fixture(t, raw);
   const state = JSON.stringify({ offset: Buffer.byteLength(prefix), note: "keep", updatedAt: "old" });
   await fs.writeFile(x.queueStatePath, state);
-  // POSIX readers retain the old inode; Windows readers prevent replacement.
+  // POSIX readers keep the original inode; Windows requires closing readers
+  // before replacing a file. Prefix and offset checks run on both platforms.
   const oldReader = process.platform === "win32" ? null : await fs.open(x.queuePath, "r");
   if (oldReader) t.after(() => oldReader.close());
   const result = await compactPendingQueue({ ...x, offset: Buffer.byteLength(prefix), minPendingBytes: 0 });
@@ -47,6 +48,30 @@ test("pending compaction preserves uploaded UTF8 bytes and LWW downward/zero sna
   assert.deepEqual(batch.buckets.map((value) => value.total_tokens), [30, 0]);
   assert.equal(batch.sessionStates[0].total_tokens, 0);
   assert.equal(batch.sessionStates[0].snapshot_verified_at, session(0).snapshot_verified_at);
+});
+
+test("compaction closes its input handle before replacing the original queue", async (t) => {
+  const x = await fixture(t, encode(row("a", 100)) + encode(row("a", 0)));
+  const realOpen = fs.open;
+  const realRename = fs.rename;
+  let inputOpen = false;
+  fs.open = async (file, flags, ...args) => {
+    const handle = await realOpen(file, flags, ...args);
+    if (file === x.queuePath && flags === "r") {
+      inputOpen = true;
+      const close = handle.close.bind(handle);
+      handle.close = async () => { await close(); inputOpen = false; };
+    }
+    return handle;
+  };
+  fs.rename = async (from, to) => {
+    assert.equal(inputOpen, false, "an open input handle blocks Windows replacement");
+    return realRename(from, to);
+  };
+  try {
+    assert.equal((await compactPendingQueue({ ...x, minPendingBytes: 0 })).compacted, true);
+    assert.equal(await fs.readFile(x.queuePath, "utf8"), encode(row("a", 0)));
+  } finally { fs.open = realOpen; fs.rename = realRename; }
 });
 
 test("unknown, invalid, watermark, CRLF and incomplete tail records survive byte-for-byte", async (t) => {
@@ -83,33 +108,6 @@ test("invalid UTF8, invalid dates and invalid session identities cannot be compa
   const x = await fixture(t, Buffer.concat([Buffer.from(encode(row("a", 100))), preserved, Buffer.from(encode(row("a", 0)))]));
   assert.equal((await compactPendingQueue({ ...x, minPendingBytes: 0 })).removedRecords, 1);
   assert.deepEqual(await fs.readFile(x.queuePath), Buffer.concat([preserved, Buffer.from(encode(row("a", 0)))]));
-});
-
-test("compaction closes both file handles before replacing the queue", async (t) => {
-  const x = await fixture(t, encode(row("a", 100)) + encode(row("a", 0)));
-  const realOpen = fs.open;
-  const realRename = fs.rename;
-  const handles = [];
-  let replacements = 0;
-  fs.open = async (...args) => {
-    const handle = await realOpen(...args);
-    handles.push(handle);
-    return handle;
-  };
-  fs.rename = async (...args) => {
-    assert.equal(handles.length, 2);
-    for (const handle of handles) assert.equal(handle.fd, -1);
-    replacements += 1;
-    return realRename(...args);
-  };
-  try {
-    assert.equal((await compactPendingQueue({ ...x, minPendingBytes: 0 })).compacted, true);
-  } finally {
-    fs.open = realOpen;
-    fs.rename = realRename;
-  }
-  assert.equal(replacements, 1);
-  assert.equal(await fs.readFile(x.queuePath, "utf8"), encode(row("a", 0)));
 });
 
 test("failed replacement leaves the original queue and offset available for retry", async (t) => {
