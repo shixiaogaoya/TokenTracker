@@ -115,11 +115,14 @@ async function compactPendingQueue({ queuePath, offset = 0, minPendingBytes = BA
     if (current.ino !== before.ino || current.size !== before.size || current.mtimeMs !== before.mtimeMs) {
       throw new Error("Queue changed during pending compaction");
     }
+    // Windows cannot replace the queue while our read handle is still open.
+    await input.close();
+    input = null;
     await fs.rename(temporary, queuePath);
     temporary = null;
     return { compacted: true, removedRecords, pendingBytesBefore, pendingBytesAfter };
   } catch (error) {
-    if (error.code === "ENOENT" && !input) return { compacted: false, removedRecords: 0, pendingBytesBefore: 0, pendingBytesAfter: 0 };
+    if (error.code === "ENOENT" && !input && !temporary) return { compacted: false, removedRecords: 0, pendingBytesBefore: 0, pendingBytesAfter: 0 };
     throw error;
   } finally {
     await input?.close();

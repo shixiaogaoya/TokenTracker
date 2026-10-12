@@ -30,14 +30,16 @@ test("pending compaction preserves uploaded UTF8 bytes and LWW downward/zero sna
   const x = await fixture(t, raw);
   const state = JSON.stringify({ offset: Buffer.byteLength(prefix), note: "keep", updatedAt: "old" });
   await fs.writeFile(x.queueStatePath, state);
-  // Existing readers keep the complete original inode across atomic rename.
-  const oldReader = await fs.open(x.queuePath, "r");
-  t.after(() => oldReader.close());
+  // POSIX readers retain the old inode; Windows readers prevent replacement.
+  const oldReader = process.platform === "win32" ? null : await fs.open(x.queuePath, "r");
+  if (oldReader) t.after(() => oldReader.close());
   const result = await compactPendingQueue({ ...x, offset: Buffer.byteLength(prefix), minPendingBytes: 0 });
   assert.equal(result.removedRecords, 4);
   assert.equal(await fs.readFile(x.queuePath, "utf8"), prefix + retained.map(encode).join(""));
-  assert.equal(await oldReader.readFile("utf8"), raw);
-  await oldReader.close();
+  if (oldReader) {
+    assert.equal(await oldReader.readFile("utf8"), raw);
+    await oldReader.close();
+  }
   assert.equal(await fs.readFile(x.queueStatePath, "utf8"), state);
   assert.equal((await compactPendingQueue({ ...x, offset: Buffer.byteLength(prefix), minPendingBytes: 0 })).compacted, false);
   const batch = await readQueueBatch(x.queuePath, Buffer.byteLength(prefix), 200);
@@ -83,6 +85,33 @@ test("invalid UTF8, invalid dates and invalid session identities cannot be compa
   assert.deepEqual(await fs.readFile(x.queuePath), Buffer.concat([preserved, Buffer.from(encode(row("a", 0)))]));
 });
 
+test("compaction closes both file handles before replacing the queue", async (t) => {
+  const x = await fixture(t, encode(row("a", 100)) + encode(row("a", 0)));
+  const realOpen = fs.open;
+  const realRename = fs.rename;
+  const handles = [];
+  let replacements = 0;
+  fs.open = async (...args) => {
+    const handle = await realOpen(...args);
+    handles.push(handle);
+    return handle;
+  };
+  fs.rename = async (...args) => {
+    assert.equal(handles.length, 2);
+    for (const handle of handles) assert.equal(handle.fd, -1);
+    replacements += 1;
+    return realRename(...args);
+  };
+  try {
+    assert.equal((await compactPendingQueue({ ...x, minPendingBytes: 0 })).compacted, true);
+  } finally {
+    fs.open = realOpen;
+    fs.rename = realRename;
+  }
+  assert.equal(replacements, 1);
+  assert.equal(await fs.readFile(x.queuePath, "utf8"), encode(row("a", 0)));
+});
+
 test("failed replacement leaves the original queue and offset available for retry", async (t) => {
   const raw = encode(row("a", 100)) + encode(row("a", 0));
   const x = await fixture(t, raw);
@@ -98,6 +127,20 @@ test("failed replacement leaves the original queue and offset available for retr
   assert.equal(await fs.readFile(x.queueStatePath, "utf8"), '{"offset":0,"note":"original"}');
   assert.deepEqual((await fs.readdir(path.dirname(x.queuePath))).sort(), ["queue.jsonl", "queue.state.json"]);
   assert.equal((await compactPendingQueue({ ...x, minPendingBytes: 0 })).compacted, true);
+});
+
+test("replacement ENOENT remains an error after the input handle closes", async (t) => {
+  const raw = encode(row("a", 100)) + encode(row("a", 0));
+  const x = await fixture(t, raw);
+  const realRename = fs.rename;
+  fs.rename = async () => { throw Object.assign(new Error("replacement missing"), { code: "ENOENT" }); };
+  try {
+    await assert.rejects(compactPendingQueue({ ...x, minPendingBytes: 0 }), { code: "ENOENT" });
+  } finally {
+    fs.rename = realRename;
+  }
+  assert.equal(await fs.readFile(x.queuePath, "utf8"), raw);
+  assert.deepEqual(await fs.readdir(path.dirname(x.queuePath)), ["queue.jsonl"]);
 });
 
 test("compaction preserves existing permissions under a restrictive umask", { skip: process.platform === "win32" }, async (t) => {
