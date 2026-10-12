@@ -5576,13 +5576,22 @@ function zcodeDbHasContent(dbPath, sqliteOptions = {}) {
   }
 }
 
-// Sync and session discovery must select the same installs. Priority modes
-// may fall back from a confirmed empty shell; exclusive and both modes retain
-// their normal selection, and failed probes stay visible to the scanner.
+// Sync, session discovery and status must select the same installs. Once sync
+// records a priority-mode choice, retain it: switching databases underneath a
+// flat cursor would accumulate both installs in the same usage ledger.
 function resolveZcodeInstallPaths({ nativeValue, wslValue } = {}, env = process.env, deps = {}) {
-  const paths = resolveInstallPaths({ nativeValue, wslValue }, env, deps);
   const mode = wsl.getWslMode(env);
-  if ((deps.platform || process.platform) !== "win32" || !["native-first", "wsl-first"].includes(mode)) {
+  const priorityMode = (deps.platform || process.platform) === "win32" && ["native-first", "wsl-first"].includes(mode);
+  const selection = deps.selection;
+  if (priorityMode && selection?.mode === mode &&
+      selection.zcodeHome === (env.ZCODE_HOME?.trim() || null) &&
+      typeof selection.dbPath === "string" && selection.dbPath) {
+    // A newly discovered or temporarily unavailable install must not change
+    // the cursor's owner. Only an explicit mode/home override releases it.
+    return { native: selection.dbPath, wsl: null };
+  }
+  const paths = resolveInstallPaths({ nativeValue, wslValue }, env, deps);
+  if (!priorityMode) {
     return paths;
   }
   const picked = paths.native || paths.wsl;

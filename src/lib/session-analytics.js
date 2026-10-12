@@ -34,6 +34,7 @@ const { computeRowCost, getModelPricingInfo } = require("./pricing");
 const { normalizePerformance, mergePerformance, createClaudePerformanceCollector, createCodexPerformanceCollector, createZcodePerformanceCollector } = require("./session-performance");
 const { readSqliteJsonRows } = require("./sqlite-reader");
 const { resolveZcodeNativeDbPath } = require("./install-resolver");
+const { readCursorStateSummary } = require("./cursor-store");
 const { USD_TICKS_PER_USD, normalizeGrokUsage } = require("./grok-usage");
 const wsl = require("./wsl-probe");
 const {
@@ -1821,11 +1822,13 @@ async function discoverSessionFiles(home, env = process.env, deps = {}) {
   const zcodeExisting = (dbPath) => (dbPath && fs.existsSync(dbPath) ? dbPath : null);
   const zcodeWslDbPath = zcodeWslHome ? path.join(zcodeWslHome, "cli", "db", "db.sqlite") : null;
   const zcodeNativeExisting = zcodeExisting(zcodeNativeDbPath);
-  const zcodeWslExisting = zcodeExisting(zcodeWslDbPath);
+  const { cursors } = zcodePlatform === "win32"
+    ? await readCursorStateSummary({ trackerDir: path.join(home, ".tokentracker", "tracker") })
+    : {};
   const zcodePaths = resolveZcodeInstallPaths({
-    nativeValue: zcodeNativeExisting,
-    wslValue: zcodeWslExisting,
-  }, env, { platform: zcodePlatform });
+    nativeValue: zcodePlatform === "win32" ? zcodeNativeDbPath : zcodeNativeExisting,
+    wslValue: zcodeWslDbPath,
+  }, env, { platform: zcodePlatform, selection: cursors?.zcodeInstallSelection });
   const zcode = [...new Set(Object.values(zcodePaths).filter(Boolean))];
   return { claude, codex: groupCodexFiles([...codex, ...archived]), grok, zcode, incomplete };
 }

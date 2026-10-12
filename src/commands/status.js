@@ -105,6 +105,7 @@ const {
   resolveCopilotAppDbPath,
   resolveCopilotAppDbPaths,
   probeWslDistros,
+  resolveZcodeInstallPaths,
 } = require("../lib/rollout");
 const {
   TRAE_CN_USAGE_ENV,
@@ -579,7 +580,10 @@ async function cmdStatus(argv = []) {
   const wslZcodeDir = process.platform === "win32" && wsl.shouldProbeWsl(process.env)
     ? wsl.discoverWslHome(".zcode")
     : null;
-  const zcodePaths = resolveInstallPaths({ nativeValue: zcodeNativeValue, wslValue: wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null });
+  const zcodePaths = resolveZcodeInstallPaths(
+    { nativeValue: zcodeNativeValue, wslValue: wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null },
+    process.env, { selection: cursors?.zcodeInstallSelection },
+  );
   const zcodeActive = formatResolvedPaths(zcodePaths);
   const zcodeInstalled = zcodeActive.length > 0;
   const zcodeDbPath = zcodeActive.join(" | ");

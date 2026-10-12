@@ -21,7 +21,11 @@ const {
 } = require("../src/lib/session-analytics");
 const { readZcodeDbMessages, parseOpencodeDbIncremental, zcodeDbHasContent, resolveZcodeInstallPaths } = require("../src/lib/rollout");
 const { multiInstallParse } = require("../src/lib/multi-install-parser");
+const { cmdSync } = require("../src/commands/sync");
+const { cmdStatus } = require("../src/commands/status");
+const { readCursorStateSummary } = require("../src/lib/cursor-store");
 const { withHome } = require("./helpers/with-home");
+const { mockPlatform, mockMethod } = require("./helpers/mock");
 const wsl = require("../src/lib/wsl-probe");
 
 // engines allow Node >= 20 but node:sqlite (used to build fixture databases
@@ -771,6 +775,115 @@ sqliteTest("both-mode usage sync counts a populated install once beside an empty
     assert.equal([...latest.values()].reduce((sum, row) => sum + row.total_tokens, 0), 900);
   }
   assert.deepEqual(reads, [empty.dbPath, populated.dbPath, empty.dbPath, populated.dbPath]);
+});
+
+for (const mode of ["wsl-first", "native-first"]) {
+  for (const forceV2 of [false, true]) {
+    sqliteTest(`${mode} retains cursor ownership after the preferred ZCode db gains data (${forceV2 ? "v2" : "legacy"} cursor store)`, async (t) => {
+      const populated = buildDb(t, (db) => {
+        insertSession(db, { id: "fallback", directory: "/repo/fallback" });
+        insertModelUsage(db, { id: "fallback-request", sessionId: "fallback", input: 500, output: 400 });
+      });
+      const empty = buildDb(t, () => {});
+      const native = mode === "wsl-first" ? populated : empty;
+      const other = mode === "wsl-first" ? empty : populated;
+      const restoreHome = withHome(native.home);
+      const previousEnv = { ZCODE_HOME: process.env.ZCODE_HOME, TOKENTRACKER_WSL_MODE: process.env.TOKENTRACKER_WSL_MODE };
+      mockPlatform(t, "win32");
+      mockMethod(t, wsl, "discoverWslHome", (provider) => provider === ".zcode" ? path.join(other.home, ".zcode") : null);
+      mockMethod(t, global, "fetch", async () => { throw new Error("unexpected network access"); });
+      process.env.ZCODE_HOME = path.join(native.home, ".zcode");
+      process.env.TOKENTRACKER_WSL_MODE = mode;
+      const trackerDir = path.join(native.home, ".tokentracker", "tracker");
+      const queuePath = path.join(trackerDir, "queue.jsonl");
+      const projectQueuePath = path.join(trackerDir, "project.queue.jsonl");
+      const statusZcode = async () => {
+        // Let node:test flush the previous test's result before capturing CLI output.
+        await new Promise((resolve) => setImmediate(resolve));
+        let output = "";
+        const write = process.stdout.write;
+        process.stdout.write = (chunk) => { output += chunk; return true; };
+        try { await cmdStatus(); } finally { process.stdout.write = write; }
+        return output.split("\n").find((line) => line.startsWith("- ZCode:"));
+      };
+      try {
+        // The diagnostic must use empty-shell fallback even before the first sync.
+        assert.ok((await statusZcode()).includes(populated.dbPath));
+        await cmdSync(["--auto", "--source=zcode"], { cursorStoreOptions: { forceV2 } });
+        const first = fs.readFileSync(queuePath, "utf8");
+        const firstProject = fs.readFileSync(projectQueuePath, "utf8");
+        const { cursors, mode: storeMode } = await readCursorStateSummary({ trackerDir });
+        assert.equal(storeMode, forceV2 ? "v2" : "legacy");
+        assert.equal(cursors.zcodeInstallSelection.dbPath, populated.dbPath);
+
+        const db = new DatabaseSync(empty.dbPath);
+        insertSession(db, { id: "new-preferred", directory: "/repo/preferred" });
+        insertModelUsage(db, { id: "new-request", sessionId: "new-preferred", input: 2000, output: 1000 });
+        db.close();
+
+        // Each command reopens persisted cursors; no in-memory selection cache.
+        for (let pass = 0; pass < 2; pass += 1) {
+          await cmdSync(["--auto", "--source=zcode"], { cursorStoreOptions: { forceV2 } });
+          assert.equal(fs.readFileSync(queuePath, "utf8"), first, "preferred database must not enter the fallback ledger");
+          assert.equal(fs.readFileSync(projectQueuePath, "utf8"), firstProject);
+          const discovered = await discoverSessionFiles(native.home, process.env, { probeWsl: true });
+          assert.deepEqual(discovered.zcode, [populated.dbPath]);
+          const sessions = await scanZcodeSessions(discovered.zcode);
+          assert.deepEqual(sessions.map((row) => row.session_id), ["fallback"]);
+          assert.equal(sessions[0].total_tokens, 900);
+          const status = await statusZcode();
+          assert.ok(status.includes(populated.dbPath));
+          assert.ok(!status.includes(empty.dbPath));
+        }
+        const fallbackDb = new DatabaseSync(populated.dbPath);
+        insertModelUsage(fallbackDb, { id: "fallback-new-request", sessionId: "fallback", input: 100, output: 100 });
+        fallbackDb.close();
+        await cmdSync(["--auto", "--source=zcode"], { cursorStoreOptions: { forceV2 } });
+        const updated = fs.readFileSync(queuePath, "utf8");
+        const latest = new Map(updated.trim().split("\n").map((line) => {
+          const row = JSON.parse(line);
+          return [`${row.source}:${row.model}:${row.hour_start}`, row];
+        }));
+        assert.equal([...latest.values()].reduce((sum, row) => sum + row.total_tokens, 0), 1100, "the selected database still imports new requests");
+        await cmdSync(["--auto", "--source=zcode"], { cursorStoreOptions: { forceV2 } });
+        assert.equal(fs.readFileSync(queuePath, "utf8"), updated, "a repeat sync does not count the new request twice");
+        const selection = (await readCursorStateSummary({ trackerDir })).cursors.zcodeInstallSelection;
+        for (const [explicitMode, expected] of [
+          ["native-only", [native.dbPath]], ["wsl-only", [other.dbPath]], ["both", [native.dbPath, other.dbPath]],
+        ]) {
+          const paths = resolveZcodeInstallPaths({ nativeValue: native.dbPath, wslValue: other.dbPath },
+            { TOKENTRACKER_WSL_MODE: explicitMode }, { platform: "win32", selection });
+          assert.deepEqual(Object.values(paths).filter(Boolean), expected, "explicit modes override the saved priority selection");
+        }
+      } finally {
+        restoreHome();
+        for (const [key, value] of Object.entries(previousEnv)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
+  }
+}
+
+sqliteTest("saved ZCode ownership survives an unavailable install without changing explicit modes or homes", (t) => {
+  const native = buildDb(t, (db) => insertSession(db, { id: "native" }));
+  const other = buildDb(t, (db) => insertSession(db, { id: "wsl" }));
+  const selection = { mode: "wsl-first", zcodeHome: null, dbPath: other.dbPath };
+  const env = { TOKENTRACKER_WSL_MODE: "wsl-first" };
+  fs.unlinkSync(other.dbPath);
+  assert.deepEqual(resolveZcodeInstallPaths({ nativeValue: native.dbPath, wslValue: null }, env,
+    { platform: "win32", selection }), { native: other.dbPath, wsl: null });
+  assert.deepEqual(resolveZcodeInstallPaths({ nativeValue: native.dbPath, wslValue: null },
+    { TOKENTRACKER_WSL_MODE: "native-only" }, { platform: "win32", selection }), { native: native.dbPath, wsl: null });
+  const replacement = buildDb(t, (db) => insertSession(db, { id: "replacement" }));
+  assert.deepEqual(resolveZcodeInstallPaths({ nativeValue: replacement.dbPath, wslValue: null },
+    { ...env, ZCODE_HOME: path.join(replacement.home, ".zcode") },
+    { platform: "win32", selection }), { native: replacement.dbPath, wsl: null });
+  const nativeSelection = { mode: "wsl-first", zcodeHome: null, dbPath: native.dbPath };
+  assert.deepEqual(resolveZcodeInstallPaths({ nativeValue: native.dbPath, wslValue: replacement.dbPath }, env,
+    { platform: "win32", selection: nativeSelection }), { native: native.dbPath, wsl: null },
+  "discovering a new preferred install must not replace the already-counted fallback");
 });
 
 sqliteTest("Codex and ZCode lineage remains independent when their session IDs collide", async (t) => {

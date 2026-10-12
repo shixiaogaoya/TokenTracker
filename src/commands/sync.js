@@ -1717,7 +1717,10 @@ async function cmdSync(argv, context = {}) {
         ? wsl.discoverWslHome(".zcode")
         : null;
       const zcodeWslValue = wslZcodeDir ? path.join(wslZcodeDir, "cli", "db", "db.sqlite") : null;
-      const zcodePaths = resolveZcodeInstallPaths({ nativeValue: zcodeNativeValue, wslValue: zcodeWslValue });
+      const zcodePaths = resolveZcodeInstallPaths(
+        { nativeValue: zcodeNativeValue, wslValue: zcodeWslValue }, process.env,
+        { selection: cursors.zcodeInstallSelection },
+      );
       if (zcodePaths.native || zcodePaths.wsl) {
         if (progress?.enabled) progress.start(`Parsing ZCode ${renderBar(0)} | buckets 0`);
         try {
@@ -1745,6 +1748,17 @@ async function cmdSync(argv, context = {}) {
             cursors, getParams: (p) => ({ dbPath: p, readFn: readZcodeDbMessages, source: "zcode", cursorKey: "zcode" }),
             queuePath, projectQueuePath, onProgress: makeProviderProgress("ZCode"),
           });
+          if (zcodeResult.recordsProcessed > 0) {
+            const mode = wsl.getWslMode(process.env);
+            if (process.platform === "win32" && ["native-first", "wsl-first"].includes(mode)) {
+              cursors.zcodeInstallSelection = {
+                mode, zcodeHome: process.env.ZCODE_HOME?.trim() || null,
+                dbPath: zcodePaths.native || zcodePaths.wsl,
+              };
+            } else {
+              delete cursors.zcodeInstallSelection;
+            }
+          }
         } catch (err) { warnProviderParseFailure("ZCode", err, opts); }
       }
     }
