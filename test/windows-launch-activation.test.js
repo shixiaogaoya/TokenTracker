@@ -17,6 +17,12 @@ test("Windows entrypoint opens the dashboard on a manual cold start", () => {
 
   assert.match(
     launch,
+    /SingleInstance\.StartListener\(\s*ctx\.ActivateDashboard,\s*ctx\.HandleDeepLink,\s*listenerCts\.Token\s*\);/,
+    "the primary instance must register the matching activation and deep-link handlers",
+  );
+
+  assert.match(
+    launch,
     /if\s*\(deepLink is not null\)\s*ctx\.HandleDeepLink\(deepLink\);\s*else if\s*\(!launchedAtStartup\)\s*wpfApp\.Dispatcher\.BeginInvoke\(new Action\(ctx\.ActivateDashboard\)\);/,
     "manual cold starts must schedule dashboard activation before the message pump, independently of the pet preference",
   );

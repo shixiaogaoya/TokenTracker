@@ -67,6 +67,7 @@ test("same-size rewrites invalidate snapshots even when file timestamps collide"
   const padding = line("padding", 0).repeat(40);
   for (const [name, before, after] of [
     ["head", line("old", 10) + padding, line("new", 20) + padding],
+    ["middle", padding + line("old", 10) + padding, padding + line("new", 20) + padding],
     ["tail", padding + line("old", 10), padding + line("new", 20)],
     ["unterminated tail", padding + line("old", 10).trimEnd(), padding + line("new", 20).trimEnd()],
   ]) {
@@ -75,7 +76,7 @@ test("same-size rewrites invalidate snapshots even when file timestamps collide"
       const x = await fixture(t, (row) => { parses++; return { key: row.key, row }; });
       assert.equal(Buffer.byteLength(before), Buffer.byteLength(after));
       await fs.writeFile(x.file, before);
-      const originalStat = await fs.stat(x.file, { bigint: true });
+      let frozenTimestamps;
       const open = fs.open;
       // Preserve real file reads, but deterministically reproduce coarse Windows
       // timestamps instead of relying on two writes landing in the same clock tick.
@@ -83,11 +84,14 @@ test("same-size rewrites invalidate snapshots even when file timestamps collide"
         const file = await open(...args);
         if (args[0] === x.file) {
           const stat = file.stat.bind(file);
-          file.stat = async (...options) => ({
-            ...await stat(...options),
-            mtimeNs: originalStat.mtimeNs,
-            ctimeNs: originalStat.ctimeNs,
-          });
+          file.stat = async (...options) => {
+            const currentStat = await stat(...options);
+            frozenTimestamps ??= {
+              mtimeNs: currentStat.mtimeNs,
+              ctimeNs: currentStat.ctimeNs,
+            };
+            return { ...currentStat, ...frozenTimestamps };
+          };
         }
         return file;
       });
@@ -103,6 +107,19 @@ test("same-size rewrites invalidate snapshots even when file timestamps collide"
       assert.ok(snapshot.some(row => row.key === "old"), "published snapshots stay immutable");
     });
   }
+});
+
+test("growth with rewritten interior rows discards stale cached buckets", async (t) => {
+  const x = await fixture(t);
+  const padding = line("padding", 0).repeat(40);
+  await fs.writeFile(x.file, padding + line("old", 10) + padding);
+  const snapshot = await x.read(x.file);
+  await fs.writeFile(x.file, padding + line("new", 20) + padding + line("appended", 30));
+  const refreshed = await x.read(x.file);
+  assert.ok(refreshed.some(row => row.key === "new" && row.value === 20));
+  assert.ok(refreshed.some(row => row.key === "appended" && row.value === 30));
+  assert.ok(!refreshed.some(row => row.key === "old"));
+  assert.ok(snapshot.some(row => row.key === "old"));
 });
 
 test("partial tails, UTF-8 chunk boundaries and malformed lines preserve completed rows", async (t) => {
