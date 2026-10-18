@@ -17,14 +17,25 @@ test("Windows entrypoint opens the dashboard on a manual cold start", () => {
 
   assert.match(
     launch,
-    /SingleInstance\.StartListener\(\s*ctx\.ActivateDashboard,\s*ctx\.HandleDeepLink,\s*listenerCts\.Token\s*\);/,
-    "the primary instance must register the matching activation and deep-link handlers",
-  );
-
-  assert.match(
-    launch,
     /if\s*\(deepLink is not null\)\s*ctx\.HandleDeepLink\(deepLink\);\s*else if\s*\(!launchedAtStartup\)\s*wpfApp\.Dispatcher\.BeginInvoke\(new Action\(ctx\.ActivateDashboard\)\);/,
     "manual cold starts must schedule dashboard activation before the message pump, independently of the pet preference",
+  );
+});
+
+test("Windows entrypoint queues forwarded work before tray initialization", () => {
+  const source = read("Program.cs");
+  const listener = source.indexOf("SingleInstance.StartListener(");
+  const initializeTray = source.indexOf("new TrayApplicationContext(");
+  const contextReady = source.indexOf("trayContext = ctx;");
+  const messagePump = source.indexOf("Application.Run(ctx);");
+  assert.ok(listener >= 0 && listener < initializeTray,
+    "the pipe must listen before tray initialization can delay a secondary launch");
+  assert.ok(initializeTray < contextReady && contextReady < messagePump,
+    "the tray context must be assigned before queued UI work can run");
+  assert.match(
+    source.slice(listener, initializeTray),
+    /SingleInstance\.StartListener\(\s*\(\) => wpfApp\.Dispatcher\.BeginInvoke\(new Action\(\(\) => trayContext!\.ActivateDashboard\(\)\)\),\s*payload => wpfApp\.Dispatcher\.BeginInvoke\(new Action\(\(\) => trayContext!\.HandleDeepLink\(payload\)\)\),\s*listenerCts\.Token\s*\);/,
+    "forwarded activation and deep links must reach their matching handlers through the UI dispatcher",
   );
 });
 

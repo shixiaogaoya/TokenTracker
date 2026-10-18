@@ -77,6 +77,15 @@ internal static class Program
             Diag.Log("program", $"WPF dispatcher exception unhandled: {e.Exception}");
         };
 
+        // Accept forwarded launches before tray initialization can block on I/O.
+        // The dispatcher runs these callbacks after trayContext is assigned and
+        // the WinForms message pump starts, so early launches are not discarded.
+        using var listenerCts = new CancellationTokenSource();
+        SingleInstance.StartListener(
+            () => wpfApp.Dispatcher.BeginInvoke(new Action(() => trayContext!.ActivateDashboard())),
+            payload => wpfApp.Dispatcher.BeginInvoke(new Action(() => trayContext!.HandleDeepLink(payload))),
+            listenerCts.Token);
+
         // Show the desktop pet on a normal launch (manual run or post-install), but stay
         // quietly in the tray when Windows auto-starts us at login or when we were only
         // spun up to relay an OAuth deep link (the pet then restores only if it was open
@@ -84,10 +93,6 @@ internal static class Program
         var showPetOnLaunch = deepLink is null && !launchedAtStartup;
         var ctx = new TrayApplicationContext(showPetOnLaunch);
         trayContext = ctx;
-
-        // Listen for manual activation and deep links from secondary launches.
-        using var listenerCts = new CancellationTokenSource();
-        SingleInstance.StartListener(ctx.ActivateDashboard, ctx.HandleDeepLink, listenerCts.Token);
 
         // Manual launches always show the dashboard; startup and deep links keep
         // their own behavior. Defer activation until the message pump is running.
