@@ -32,9 +32,16 @@ function createAsyncQueueReader({ parseRow, label, maxEntries = 4 }) {
       // between stat and open. Its signature always describes the bytes we read.
       const stat = await file.stat({ bigint: true });
       const nextSignature = signature(stat);
-      if (cached?.signature === nextSignature) return cached.rows;
       const identity = `${stat.dev}:${stat.ino}`;
       const size = Number(stat.size);
+      if (cached?.signature === nextSignature) {
+        // Windows can reuse mtime/ctime for rapid same-size writes. Validate
+        // boundary bytes before reusing rows, including an unterminated tail.
+        const head = await probe(file, 0, cached.head.length);
+        const tailProbe = size <= PROBE_BYTES ? head
+          : await probe(file, size - cached.tailProbe.length, cached.tailProbe.length);
+        if (head.equals(cached.head) && tailProbe.equals(cached.tailProbe)) return cached.rows;
+      }
       let offset = 0;
       let seen = new Map();
       if (cached && cached.identity === identity && size > cached.size && cached.consumedBytes > 0) {
@@ -81,8 +88,10 @@ function createAsyncQueueReader({ parseRow, label, maxEntries = 4 }) {
       remainder += decoder.end();
       // Capture probes before committing any state: a failed read must not mutate
       // a snapshot still being used by another endpoint.
-      const head = await probe(file, 0, Math.min(PROBE_BYTES, consumedBytes));
+      const head = await probe(file, 0, Math.min(PROBE_BYTES, size));
       const anchor = await probe(file, Math.max(0, consumedBytes - PROBE_BYTES), Math.min(PROBE_BYTES, consumedBytes));
+      const tailProbe = size <= PROBE_BYTES ? head
+        : await probe(file, size - PROBE_BYTES, PROBE_BYTES);
       for (const [key, row] of changes) seen.set(key, row);
       const tail = new Map();
       parse(remainder, tail);
@@ -90,7 +99,7 @@ function createAsyncQueueReader({ parseRow, label, maxEntries = 4 }) {
       // key never enters the committed map (completion may change that key).
       const rows = tail.size ? Array.from(new Map([...seen, ...tail]).values()) : Array.from(seen.values());
       cache.delete(queuePath);
-      cache.set(queuePath, { signature: nextSignature, identity, size, consumedBytes, head, anchor, seen, rows });
+      cache.set(queuePath, { signature: nextSignature, identity, size, consumedBytes, head, anchor, tailProbe, seen, rows });
       while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
       if (malformed) console.error(`[LocalAPI] ${label}: skipped ${malformed} malformed line(s)`);
       return rows;

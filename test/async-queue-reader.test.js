@@ -63,6 +63,48 @@ test("replacement, truncation, same-size rewrites and deletion discard stale buc
   assert.deepEqual(await x.read(x.file), [{ key: "fresh", value: 40 }]);
 });
 
+test("same-size rewrites invalidate snapshots even when file timestamps collide", async (t) => {
+  const padding = line("padding", 0).repeat(40);
+  for (const [name, before, after] of [
+    ["head", line("old", 10) + padding, line("new", 20) + padding],
+    ["tail", padding + line("old", 10), padding + line("new", 20)],
+    ["unterminated tail", padding + line("old", 10).trimEnd(), padding + line("new", 20).trimEnd()],
+  ]) {
+    await t.test(name, async (t) => {
+      let parses = 0;
+      const x = await fixture(t, (row) => { parses++; return { key: row.key, row }; });
+      assert.equal(Buffer.byteLength(before), Buffer.byteLength(after));
+      await fs.writeFile(x.file, before);
+      const originalStat = await fs.stat(x.file, { bigint: true });
+      const open = fs.open;
+      // Preserve real file reads, but deterministically reproduce coarse Windows
+      // timestamps instead of relying on two writes landing in the same clock tick.
+      t.mock.method(fs, "open", async (...args) => {
+        const file = await open(...args);
+        if (args[0] === x.file) {
+          const stat = file.stat.bind(file);
+          file.stat = async (...options) => ({
+            ...await stat(...options),
+            mtimeNs: originalStat.mtimeNs,
+            ctimeNs: originalStat.ctimeNs,
+          });
+        }
+        return file;
+      });
+
+      const snapshot = await x.read(x.file);
+      const coldParses = parses;
+      assert.equal(await x.read(x.file), snapshot, "unchanged reads reuse the snapshot");
+      assert.equal(parses, coldParses, "unchanged reads must not parse rows again");
+      await fs.writeFile(x.file, after);
+      const refreshed = await x.read(x.file);
+      assert.ok(refreshed.some(row => row.key === "new" && row.value === 20));
+      assert.ok(!refreshed.some(row => row.key === "old"), "rewrites discard stale keys");
+      assert.ok(snapshot.some(row => row.key === "old"), "published snapshots stay immutable");
+    });
+  }
+});
+
 test("partial tails, UTF-8 chunk boundaries and malformed lines preserve completed rows", async (t) => {
   const x = await fixture(t);
   const unicode = "中🙂".repeat(20_000);
