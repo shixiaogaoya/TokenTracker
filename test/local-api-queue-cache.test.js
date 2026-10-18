@@ -52,7 +52,7 @@ async function callEndpoint(handler, endpoint) {
 test("local usage endpoints reuse one parsed queue until the file changes", async () => {
   const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "tt-queue-cache-"));
   const queuePath = path.join(tmp, "queue.jsonl");
-  await fs.promises.writeFile(queuePath, `${JSON.stringify(queueRow(100))}\n`);
+  await fs.promises.writeFile(queuePath, `${JSON.stringify(queueRow(100))}\n`.repeat(20));
   const handler = createLocalApiHandler({ queuePath });
 
   const originalOpen = fs.promises.open;
@@ -82,8 +82,11 @@ test("local usage endpoints reuse one parsed queue until the file changes", asyn
     assert.equal(summary.totals.total_tokens, 100);
     assert.equal(daily.data[0].total_tokens, 100);
     const coldReadBytes = queueBytes;
+    assert.ok(coldReadBytes > 512, "the queue must exceed the content-probe budget");
     await callEndpoint(handler, "/functions/tokentracker-usage-summary?tz=UTC");
-    assert.equal(queueBytes, coldReadBytes, "unchanged snapshots do not reread queue bytes");
+    const validationBytes = queueBytes - coldReadBytes;
+    assert.ok(validationBytes > 0 && validationBytes <= 512,
+      "unchanged snapshots validate bounded boundary bytes without rescanning the queue");
 
     // Appending invalidates the signature, but the queue is append-only, so
     // the refresh reads just the new tail instead of the whole file.
